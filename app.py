@@ -1,63 +1,100 @@
 import streamlit as st
+import mercadopago
+import requests  # Adicionamos esta biblioteca para chamar o Telegram
 
-# Configuração da página para estilo mobile e azul escuro
-st.set_page_config(page_title="Puma Express", page_icon="⚡", layout="centered")
+# --- CONFIGURAÇÕES ---
+# Pegamos as chaves dos secrets (Lembre-se de adicionar no secrets.toml)
+try:
+    ACCESS_TOKEN = st.secrets["MP_ACCESS_TOKEN"]
+    sdk = mercadopago.SDK(ACCESS_TOKEN)
+    
+    # NOVAS CONFIGURAÇÕES DO TELEGRAM
+    TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"] # O token do BotFather
+    TELEGRAM_CHAT_ID = st.secrets["TELEGRAM_CHAT_ID"] # O seu ID numérico
+except Exception as e:
+    st.error("Erro ao carregar os Secrets. Verifique o arquivo .streamlit/secrets.toml")
 
-# Estilização CSS personalizada (Azul Escuro)
-st.markdown('''
-    <style>
-    .stApp {
-        background-color: #0A192F;
-        color: white;
+# --- FUNÇÕES ---
+def criar_pagamento_pix(valor, descricao, email_cliente="cliente@email.com"):
+    payment_data = {
+        "transaction_amount": float(valor),
+        "description": descricao,
+        "payment_method_id": "pix",
+        "payer": {
+            "email": email_cliente,
+        }
     }
-    h1, h2, h3 {
-        color: #64FFDA;
-    }
-    .stButton>button {
-        background-color: #64FFDA;
-        color: #0A192F;
-        font-weight: bold;
-        border-radius: 10px;
-    }
-    .stNumberInput>div>div>input {
-        background-color: #112240;
-        color: white;
-    }
-    </style>
-''', unsafe_allow_html=True)
+    result = sdk.payment().create(payment_data)
+    return result["response"]
 
-# Título e Cardápio
-st.title("⚡ Puma Express")
-st.write("Selecione seus itens e peça direto no WhatsApp")
+def enviar_notificacao_telegram(mensagem):
+    """Envia uma mensagem automática para o seu Telegram"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": mensagem,
+        "parse_mode": "Markdown" # Permite usar negrito
+    }
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print("Erro ao enviar Telegram:", e)
 
-cardapio = {
-    "Energético": 10.00,
-    "Coca-Cola (Lata)": 6.00,
-    "Água Mineral": 3.00,
-    "Chocolate": 4.00
-}
+# --- FRONTEND E LÓGICA ---
+st.set_page_config(page_title="PontoLabs Express", layout="centered")
 
+st.title("⚡ PontoLabs Express")
+st.write("Escolha seu kit de sobrevivência:")
+
+cardapio = {"Energético": 10.00, "Coca-Cola (Lata)": 6.00, "Chocolate": 4.00}
 carrinho = {}
 
 for item, preco in cardapio.items():
     col1, col2 = st.columns([2, 1])
-    col1.markdown(f"**{item}**<br>R$ {preco:.2f}", unsafe_allow_html=True)
-    qtd = col2.number_input("", min_value=0, max_value=10, key=item)
+    col1.write(f"**{item}** - R$ {preco:.2f}")
+    qtd = col2.number_input(f"Qtd_{item}", min_value=0, max_value=10, key=item, label_visibility="collapsed")
     if qtd > 0:
         carrinho[item] = qtd
 
-# Finalização
-if st.button("Finalizar Pedido"):
+if st.button("Gerar Pagamento Pix"):
     if not carrinho:
-        st.warning("Seu carrinho está vazio!")
+        st.warning("O carrinho está vazio.")
     else:
         total = sum(cardapio[item] * qtd for item, qtd in carrinho.items())
-        itens_resumo = ", ".join([f"{qtd}x {item}" for item, qtd in carrinho.items()])
-        mensagem = f"Olá, gostaria de fazer um pedido no PumaExpress: {itens_resumo}. Total: R$ {total:.2f}"
+        resumo = ", ".join([f"{qtd}x {item}" for item, qtd in carrinho.items()])
         
-        # Link para WhatsApp
-        wa_link = f"https://wa.me/5581986302122?text={mensagem.replace(' ', '%20')}"
+        with st.spinner("A gerar o seu Pix..."):
+            resposta_pix = criar_pagamento_pix(total, f"Pedido: {resumo}")
+            
+            if "id" in resposta_pix:
+                st.session_state.payment_id = resposta_pix["id"]
+                st.session_state.qr_code_base64 = resposta_pix["point_of_interaction"]["transaction_data"]["qr_code_base64"]
+                st.session_state.qr_code = resposta_pix["point_of_interaction"]["transaction_data"]["qr_code"]
+                st.session_state.resumo = resumo
+                st.session_state.total = total
+
+# --- FLUXO DE PAGAMENTO E NOTIFICAÇÃO ---
+if "payment_id" in st.session_state:
+    st.divider()
+    st.subheader("Pagamento via Pix")
+    st.image(f"data:image/jpeg;base64,{st.session_state.qr_code_base64}", caption="Leia o QR Code no app do seu banco")
+    st.code(st.session_state.qr_code, language="text")
+    
+    st.info("O sistema verificará seu pagamento automaticamente. Ou clique abaixo para checar agora.")
+    
+    if st.button("Verificar Pagamento"):
+        with st.spinner("Consultando banco..."):
+            estado = sdk.payment().get(st.session_state.payment_id)["response"]["status"]
         
-        st.success(f"### Total: R$ {total:.2f}")
-        st.markdown(f"### [Clique aqui para enviar o pedido no WhatsApp]({wa_link})", unsafe_allow_html=True)
-        st.info("Aguardando confirmação do pagamento via Pix.")
+        if estado == "approved":
+            st.success("✅ Pagamento Aprovado! Estamos preparando o seu pedido.")
+            st.balloons()
+            
+            # --- O SISTEMA AVISA VOCÊ AUTOMATICAMENTE ---
+            msg_alerta = f"🚨 *NOVO PEDIDO PAGO!*\n\n📦 *Itens:* {st.session_state.resumo}\n💰 *Valor:* R$ {st.session_state.total:.2f}\n\n_Bora entregar, guerreiro!_"
+            enviar_notificacao_telegram(msg_alerta)
+            
+            # Limpa o ID para o próximo pedido
+            del st.session_state.payment_id
+        else:
+            st.warning("⏳ Pagamento ainda não caiu. Se já pagou, espere uns segundos.")
